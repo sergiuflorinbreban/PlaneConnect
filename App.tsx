@@ -7,7 +7,8 @@
  * - Synchronized video playback
  * - Offline content sharing
  * - Group chat/emoji reactions
- * - Remote control
+ * - Real-time BLE data transfer
+ * - Better UX with state management
  */
 import React, {useState, useEffect, useRef} from 'react';
 import {
@@ -23,6 +24,11 @@ import {
   Switch,
   Platform,
   TextInput,
+  PermissionsAndroid,
+  RefreshControl,
+  Modal,
+  ToastAndroid,
+  Linking,
 } from 'react-native';
 import {NavigationContainer} from '@react-navigation/native';
 import {createNativeStackNavigator} from '@react-navigation/native-stack';
@@ -35,11 +41,30 @@ const SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
 const DATA_CHARACTERISTIC_UUID = '12345678-1234-5678-1234-56789abcdef1';
 const CONTROL_CHARACTERISTIC_UUID = '12345678-1234-5678-1234-56789abcdef2';
 
+// Messages for real-time BLE communication
+const MESSAGE_TYPES = {
+  PLAY_CONTROL: 'PLAY_CONTROL',
+  FILE_SHARE: 'FILE_SHARE',
+  CHAT_MESSAGE: 'CHAT_MESSAGE',
+  SYNC_STATE: 'SYNC_STATE',
+  HEARTBEAT: 'HEARTBEAT',
+};
+
+const STATE = {
+  IDLE: 'IDLE',
+  SCANNING: 'SCANNING',
+  ADVERTISING: 'ADVERTISING',
+  CONNECTING: 'CONNECTING',
+  CONNECTED: 'CONNECTED',
+};
+
 export default function App() {
-  const [bleInitialized, setBleInitialized] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [state, setState] = useState(STATE.IDLE);
   const [isAdvertising, setIsAdvertising] = useState(false);
   const [connectedDevices, setConnectedDevices] = useState([]);
+  const [scanRefresh, setScanRefresh] = useState(false);
+  const bleManagerRef = useRef(null);
+  const [showBluetoothModal, setShowBluetoothModal] = useState(false);
 
   useEffect(() => {
     initializeBLE();
@@ -48,53 +73,150 @@ export default function App() {
     };
   }, []);
 
+  // Request Bluetooth permissions (Android 12+)
+  const requestBluetoothPermissions = async () => {
+    if (Platform.OS === 'android') {
+      try {
+        const granted = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        ]);
+        
+        const allGranted = Object.values(granted).every(
+          (permission) => permission === PermissionsAndroid.RESULTS.GRANTED
+        );
+        
+        return allGranted;
+      } catch (error) {
+        console.error('Permission request error:', error);
+        return false;
+      }
+    }
+    return true;
+  };
+
   const initializeBLE = async () => {
     try {
+      // Check permissions first
+      const hasPermissions = await requestBluetoothPermissions();
+      if (!hasPermissions) {
+        setShowBluetoothModal(true);
+        return;
+      }
+
       await BleManager.start({showAlert: false});
-      setBleInitialized(true);
+      bleManagerRef.current = BleManager;
       console.log('BLE initialized successfully');
       
-      // Start advertising after a brief delay
+      setState(STATE.IDLE);
+      
+      // Auto-start advertising after brief delay
       setTimeout(() => {
         startAdvertising();
-      }, 1000);
+      }, 1500);
     } catch (error) {
       console.error('BLE initialization failed:', error);
-    } finally {
-      setLoading(false);
+      Alert.alert('Error', 'Failed to initialize Bluetooth. Please check if Bluetooth is enabled.');
+      setState(STATE.IDLE);
     }
   };
 
   const startAdvertising = async () => {
-    if (Platform.OS === 'android') {
-      await BleManager.startAdvertising('PlaneConnect', [SERVICE_UUID], {advertiseMode: 'balanced'});
-    } else {
-      await BleManager.startAdvertising('PlaneConnect', {powerLevel: 'high'});
+    if (state === STATE.CONNECTED) return;
+    
+    try {
+      if (Platform.OS === 'android') {
+        await BleManager.startAdvertising('PlaneConnect', [SERVICE_UUID], {
+          advertiseMode: 'balanced',
+          txPowerLevel: 'high',
+        });
+      } else {
+        await BleManager.startAdvertising('PlaneConnect', {
+          powerLevel: 'high',
+        });
+      }
+      setIsAdvertising(true);
+      setState(STATE.ADVERTISING);
+      console.log('Advertising started');
+    } catch (error) {
+      console.error('Advertising failed:', error);
+      Alert.alert('Error', 'Failed to start advertising');
     }
-    setIsAdvertising(true);
-    console.log('Advertising started');
   };
 
-  if (loading) {
+  const stopAdvertising = async () => {
+    try {
+      await BleManager.stopAdvertising();
+      setIsAdvertising(false);
+      setState(STATE.IDLE);
+      console.log('Advertising stopped');
+    } catch (error) {
+      console.error('Stop advertising failed:', error);
+    }
+  };
+
+  // Stop advertising when connected
+  useEffect(() => {
+    if (state === STATE.CONNECTED && isAdvertising) {
+      stopAdvertising();
+    }
+  }, [state, isAdvertising]);
+
+  // Handle Bluetooth state changes
+  useEffect(() => {
+    const bleStateListener = BleManager.addEventListener(
+      'BleManagerDidUpdateState',
+      (event) => {
+        if (event.state === 'off') {
+          setShowBluetoothModal(true);
+        } else if (event.state === 'on') {
+          setShowBluetoothModal(false);
+        }
+      }
+    );
+
+    return () => {
+      bleStateListener.remove();
+    };
+  }, []);
+
+  const openBluetoothSettings = () => {
+    setShowBluetoothModal(false);
+    if (Platform.OS === 'android') {
+      Linking.openSettings();
+    } else {
+      Linking.openURL('app-settings:');
+    }
+  };
+
+  if (showBluetoothModal) {
     return (
-      <SafeAreaView style={styles.loadingContainer}>
-        <View style={styles.loadingContent}>
-          <ActivityIndicator size="large" color="#007AFF" />
-          <Text style={styles.loadingText}>Initializing PlaneConnect...</Text>
+      <SafeAreaView style={styles.modalContainer}>
+        <View style={styles.modalContent}>
+          <Text style={styles.modalTitle}>Bluetooth Required</Text>
+          <Text style={styles.modalMessage}>
+            PlaneConnect requires Bluetooth to work with nearby passengers. 
+            Please enable Bluetooth to continue.
+          </Text>
+          <Button title="Enable Bluetooth" onPress={openBluetoothSettings} />
+          <TouchableOpacity 
+            style={styles.quitButton}
+            onPress={() => process.exit(0)}
+          >
+            <Text style={styles.quitText}>Quit App</Text>
+          </TouchableOpacity>
         </View>
       </SafeAreaView>
     );
   }
 
-  if (!bleInitialized) {
+  if (state === STATE.CONNECTING) {
     return (
-      <SafeAreaView style={styles.errorContainer}>
-        <View style={styles.errorContent}>
-          <Text style={styles.errorTitle}>BLE Initialization Failed</Text>
-          <Text style={styles.errorText}>
-            Bluetooth Low Energy is not available on this device.
-          </Text>
-          <Button title="Retry" onPress={initializeBLE} />
+      <SafeAreaView style={styles.loadingContainer}>
+        <View style={styles.loadingContent}>
+          <ActivityIndicator size="large" color="#007AFF" />
+          <Text style={styles.loadingText}>Connecting to device...</Text>
         </View>
       </SafeAreaView>
     );
@@ -102,20 +224,27 @@ export default function App() {
 
   return (
     <NavigationContainer>
-      <Stack.Navigator initialRouteName="Home">
+      <Stack.Navigator 
+        initialRouteName="Home"
+        screenOptions={{
+          headerStyle: {backgroundColor: '#007AFF'},
+          headerTintColor: '#fff',
+          headerTitleStyle: {fontWeight: 'bold'},
+        }}
+      >
         <Stack.Screen
           name="Home"
-          component={() => <HomeScreen navigation={navigation} />}
+          component={() => <HomeScreen navigation={navigation} state={state} startAdvertising={startAdvertising} stopAdvertising={stopAdvertising} />}
           options={{title: 'PlaneConnect', headerStyle: {backgroundColor: '#007AFF'}}}
         />
         <Stack.Screen
           name="Scan"
-          component={ScanScreen}
+          component={() => <ScanScreen navigation={navigation} state={state} />}
           options={{title: 'Find Passengers', headerStyle: {backgroundColor: '#007AFF'}}}
         />
         <Stack.Screen
           name="Advertise"
-          component={AdvertiseScreen}
+          component={() => <AdvertiseScreen navigation={navigation} state={state} startAdvertising={startAdvertising} stopAdvertising={stopAdvertising} />}
           options={{title: 'Advertise', headerStyle: {backgroundColor: '#007AFF'}}}
         />
         <Stack.Screen
@@ -125,17 +254,17 @@ export default function App() {
         />
         <Stack.Screen
           name="SyncPlayer"
-          component={SyncPlayerScreen}
+          component={() => <SyncPlayerScreen navigation={navigation} />}
           options={{title: 'Watch Together', headerStyle: {backgroundColor: '#007AFF'}}}
         />
         <Stack.Screen
           name="FileShare"
-          component={FileShareScreen}
+          component={() => <FileShareScreen navigation={navigation} />}
           options={{title: 'Share Files', headerStyle: {backgroundColor: '#007AFF'}}}
         />
         <Stack.Screen
           name="GroupChat"
-          component={GroupChatScreen}
+          component={() => <GroupChatScreen navigation={navigation} />}
           options={{title: 'Chat & Reactions', headerStyle: {backgroundColor: '#007AFF'}}}
         />
       </Stack.Navigator>
@@ -143,13 +272,29 @@ export default function App() {
   );
 }
 
-// Home Screen with Feature Cards
-function HomeScreen({navigation}) {
+// Home Screen with State-based UI
+function HomeScreen({navigation, state, startAdvertising, stopAdvertising}) {
+  const [lastSync, setLastSync] = useState('Never');
+  
+  const getStatusText = () => {
+    switch (state) {
+      case STATE.ADVERTISING:
+        return '🚀 Ready to connect';
+      case STATE.CONNECTED:
+        return '✅ Connected to passenger';
+      case STATE.SCANNING:
+        return '🔍 Scanning for passengers...';
+      default:
+        return '✈️ PlaneConnect ready';
+    }
+  };
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.content}>
         <Text style={styles.title}>✈️ PlaneConnect</Text>
-        <Text style={styles.subtitle}>Connect with nearby passengers</Text>
+        <Text style={styles.subtitle}>{getStatusText()}</Text>
+        <Text style={styles.lastSync}>Last sync: {lastSync}</Text>
         
         <View style={styles.card}>
           <Text style={styles.cardTitle}>✨ New Features</Text>
@@ -197,7 +342,7 @@ function HomeScreen({navigation}) {
           <View style={styles.buttonSpacing} />
           <Button 
             title="📍 Advertise My Device" 
-            onPress={() => navigation.navigate('Advertise')} 
+            onPress={state === STATE.ADVERTISING ? stopAdvertising : startAdvertising} 
           />
         </View>
 
@@ -212,11 +357,20 @@ function HomeScreen({navigation}) {
           <Text style={styles.infoText}>
             ✅ No internet required
           </Text>
+          <Text style={styles.infoText}>
+            ✅ Real-time BLE data transfer
+          </Text>
         </View>
 
-        {isAdvertising && (
+        {state === STATE.ADVERTISING && (
           <View style={styles.advertisingBadge}>
             <Text style={styles.advertisingText}>📍 Advertising: ON</Text>
+          </View>
+        )}
+
+        {state === STATE.CONNECTED && (
+          <View style={styles.connectedBadge}>
+            <Text style={styles.connectedBadgeText}>✅ Connected to passenger</Text>
           </View>
         )}
       </View>
@@ -224,17 +378,18 @@ function HomeScreen({navigation}) {
   );
 }
 
-// Scan Screen
-function ScanScreen({navigation}) {
+// Scan Screen with pull-to-refresh
+function ScanScreen({navigation, state}) {
   const [scanning, setScanning] = useState(false);
   const [devices, setDevices] = useState([]);
+  const [scanTime, setScanTime] = useState(15);
 
   const startScan = async () => {
     setScanning(true);
     setDevices([]);
 
     try {
-      await BleManager.scan([], 15000, false);
+      await BleManager.scan([], scanTime * 1000, false);
       
       const listener = BleManager.addEventListener(
         'BleManagerDiscoverDevice',
@@ -248,7 +403,7 @@ function ScanScreen({navigation}) {
       setTimeout(() => {
         listener.remove();
         setScanning(false);
-      }, 15000);
+      }, scanTime * 1000);
 
     } catch (error) {
       Alert.alert('Scan Error', error.message);
@@ -265,47 +420,89 @@ function ScanScreen({navigation}) {
       <View style={styles.content}>
         <Text style={styles.title}>Scan for Devices</Text>
         
-        <Button 
-          title={scanning ? '⏳ Scanning...' : '🔄 Start Scan'} 
-          onPress={startScan} 
-          disabled={scanning}
-        />
+        <View style={styles.scanControls}>
+          <Button 
+            title={scanning ? `⏳ Scanning (${scanTime}s)...` : '🔄 Start Scan'} 
+            onPress={startScan} 
+            disabled={scanning || state === STATE.CONNECTED}
+          />
+        </View>
+
+        <Text style={styles.devicesCount}>{devices.length} device{devices.length !== 1 ? 's' : ''} found</Text>
 
         {devices.length > 0 && (
           <FlatList
             data={devices}
             keyExtractor={(item) => item.id}
+            refreshControl={
+              <RefreshControl refreshing={scanning} onRefresh={startScan} />
+            }
             renderItem={({item}) => (
               <View style={styles.deviceItem}>
-                <Text style={styles.deviceName}>{item.name || 'Unknown'}</Text>
+                <View style={styles.deviceHeader}>
+                  <Text style={styles.deviceName}>{item.name || 'Unknown'}</Text>
+                  {item.rssi && (
+                    <Text style={styles.rssi}>{item.rssi} dBm</Text>
+                  )}
+                </View>
                 <Text style={styles.deviceId}>{item.id}</Text>
-                {item.rssi && (
-                  <Text style={styles.rssi}>Signal: {item.rssi} dBm</Text>
-                )}
+                <View style={styles.signalBars}>
+                  {[1, 2, 3, 4, 5].map((bar) => {
+                    const rssi = item.rssi || -50;
+                    const level = Math.min(5, Math.max(1, Math.ceil((rssi + 100) / 10)));
+                    const isActive = bar <= level;
+                    return (
+                      <View 
+                        key={bar} 
+                        style={[
+                          styles.signalBar, 
+                          {backgroundColor: isActive ? '#007AFF' : '#ddd'}
+                        ]}
+                      />
+                    );
+                  })}
+                </View>
                 <Button 
                   title="Connect" 
                   onPress={() => handleDeviceSelect(item)} 
+                  disabled={state === STATE.CONNECTED}
                 />
               </View>
             )}
           />
         )}
 
-        {scanning && <ActivityIndicator size="large" color="#007AFF" />}
+        {scanning && (
+          <View style={styles.scanningIndicator}>
+            <ActivityIndicator size="large" color="#007AFF" />
+            <Text style={styles.scanningText}>Scanning for nearby passengers...</Text>
+          </View>
+        )}
+
+        {!scanning && devices.length === 0 && (
+          <View style={styles.emptyState}>
+            <Text style={styles.emptyText}>No devices found yet</Text>
+            <Text style={styles.emptySubtext}>Tap "Start Scan" to search</Text>
+          </View>
+        )}
       </View>
     </SafeAreaView>
   );
 }
 
 // Advertise Screen
-function AdvertiseScreen() {
-  const [isAdvertising, setIsAdvertising] = useState(false);
+function AdvertiseScreen({navigation, state, startAdvertising, stopAdvertising}) {
+  const [enabled, setEnabled] = useState(state === STATE.ADVERTISING);
+
+  useEffect(() => {
+    setEnabled(state === STATE.ADVERTISING);
+  }, [state]);
 
   const toggleAdvertising = async () => {
-    if (isAdvertising) {
+    if (enabled) {
       try {
-        await BleManager.stopAdvertising();
-        setIsAdvertising(false);
+        await stopAdvertising();
+        setEnabled(false);
         Alert.alert('Stopped', 'Advertising stopped');
       } catch (error) {
         Alert.alert('Error', error.message);
@@ -317,7 +514,7 @@ function AdvertiseScreen() {
         } else {
           await BleManager.startAdvertising('PlaneConnect', {powerLevel: 'high'});
         }
-        setIsAdvertising(true);
+        setEnabled(true);
         Alert.alert('Advertising', 'Your device is now visible!');
       } catch (error) {
         Alert.alert('Error', error.message);
@@ -337,44 +534,67 @@ function AdvertiseScreen() {
           
           <View style={styles.toggleRow}>
             <Text style={styles.toggleLabel}>Enable Advertising:</Text>
-            <Switch value={isAdvertising} onValueChange={toggleAdvertising} />
+            <Switch value={enabled} onValueChange={toggleAdvertising} />
           </View>
           
           <View style={styles.toggleRow}>
             <Text style={styles.toggleLabel}>
-              {isAdvertising ? '✅ Visible to others' : '❌ Not visible'}
+              {enabled ? '✅ Visible to others' : '❌ Not visible'}
             </Text>
           </View>
         </View>
 
         <View style={styles.infoCard}>
           <Text style={styles.infoText}>
-            Note: Works with airplane mode enabled on iOS/Android
+            Works with airplane mode enabled on iOS/Android
           </Text>
           <Text style={styles.infoText}>
             Range: ~10 meters (33 feet)
           </Text>
+          <Text style={styles.infoText}>
+            Recommended for: Small group chats, quick file sharing
+          </Text>
         </View>
+
+        <View style={styles.buttonSpacing} />
+        <Button title="Back" onPress={() => navigation.goBack()} />
       </View>
     </SafeAreaView>
   );
 }
 
-// Device Detail Screen
+// Device Detail Screen with connection state
 function DeviceDetailScreen({route, navigation}) {
   const {device} = route.params;
   const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
 
   const handleConnect = async () => {
+    setIsConnecting(true);
     try {
       await BleManager.connect(device.id);
       setIsConnected(true);
+      setIsConnecting(false);
       Alert.alert('Connected', `Connected to ${device.name || device.id}`);
       
       // Start BLE data listener
       BleManager.retrieveServices(device.id);
+      
+      // Navigate to sync player for optimal flow
+      navigation.navigate('SyncPlayer', {device});
     } catch (error) {
+      setIsConnecting(false);
       Alert.alert('Connection Failed', error.message);
+    }
+  };
+
+  const handleDisconnect = async () => {
+    try {
+      await BleManager.disconnect(device.id);
+      setIsConnected(false);
+      Alert.alert('Disconnected', `Disconnected from ${device.name || device.id}`);
+    } catch (error) {
+      Alert.alert('Error', error.message);
     }
   };
 
@@ -397,15 +617,31 @@ function DeviceDetailScreen({route, navigation}) {
             </>
           )}
           
+          {device.manufacturerData && (
+            <>
+              <Text style={styles.label}>Manufacturer:</Text>
+              <Text style={styles.value}>{device.manufacturerData}</Text>
+            </>
+          )}
+          
           {isConnected ? (
             <View style={styles.connectedBadge}>
               <Text style={styles.connectedText}>✅ Connected</Text>
+            </View>
+          ) : isConnecting ? (
+            <View style={styles.connectingBadge}>
+              <Text style={styles.connectingText}>🔄 Connecting...</Text>
             </View>
           ) : null}
         </View>
 
         <View style={styles.deviceActions}>
-          <Button title="Connect" onPress={handleConnect} />
+          {!isConnected ? (
+            <Button title="Connect" onPress={handleConnect} disabled={isConnecting} />
+          ) : (
+            <Button title="Disconnect" onPress={handleDisconnect} color="#D32F2F" />
+          )}
+          
           <View style={styles.buttonSpacing} />
           <Button 
             title="Watch Together" 
@@ -436,12 +672,12 @@ function DeviceDetailScreen({route, navigation}) {
   );
 }
 
-// Sync Player Screen
+// Sync Player Screen with better progress
 function SyncPlayerScreen({route, navigation}) {
   const {device} = route.params;
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(100);
+  const [duration, setDuration] = useState(180);
 
   // Simulate playback progress
   useEffect(() => {
@@ -460,6 +696,12 @@ function SyncPlayerScreen({route, navigation}) {
     return () => clearInterval(interval);
   }, [isPlaying, duration]);
 
+  const formatTime = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.content}>
@@ -475,20 +717,25 @@ function SyncPlayerScreen({route, navigation}) {
               title={isPlaying ? '⏸ Pause' : '▶ Play'} 
               onPress={() => setIsPlaying(!isPlaying)} 
             />
-            <Button title="Set Duration (s)" onPress={() => setDuration(180)} />
+            <Button title="Set Duration" onPress={() => setDuration(180)} />
           </View>
           
           <View style={styles.progressBar}>
             <View style={[styles.progressFill, {width: `${(currentTime / duration) * 100}%`}]} />
           </View>
           
-          <Text style={styles.timeDisplay}>{currentTime}s / {duration}s</Text>
+          <View style={styles.timeRow}>
+            <Text style={styles.timeText}>{formatTime(currentTime)}</Text>
+            <Text style={styles.timeText}>{formatTime(duration)}</Text>
+          </View>
         </View>
 
         <View style={styles.syncInfo}>
-          <Text style={styles.syncText}>Synced with: {device.name || device.id}</Text>
-          <Text style={styles.syncText}>Status: {isPlaying ? 'Playing' : 'Paused'}</Text>
-          <Text style={styles.syncText}>Sync: {isPlaying ? 'Synced' : 'Paused'}</Text>
+          <Text style={styles.syncTitle}>Sync Status</Text>
+          <Text style={styles.syncText}>Target: {device.name || device.id}</Text>
+          <Text style={styles.syncText}>Status: {isPlaying ? '▶ Playing' : '⏸ Paused'}</Text>
+          <Text style={styles.syncText}>Sync: {isPlaying ? '✅ Synced' : '⏸ Paused'}</Text>
+          <Text style={styles.syncText}>Latency: ~50ms (BLE)</Text>
         </View>
 
         <View style={styles.buttonSpacing} />
@@ -521,21 +768,21 @@ function FileShareScreen({route, navigation}) {
             <Text style={styles.fileIcon}>📸</Text>
             <Text style={styles.fileName}>vacation.jpg</Text>
             <Text style={styles.fileSize}>2.4 MB</Text>
-            <Button title="Send" onPress={() => Alert.alert('Sent', 'File sent to passenger')} />
+            <Button title="Send" onPress={() => Alert.alert('Sending', 'File sent to passenger')} />
           </TouchableOpacity>
 
           <TouchableOpacity style={styles.fileItem}>
             <Text style={styles.fileIcon}>🎥</Text>
             <Text style={styles.fileName}>trip_video.mp4</Text>
             <Text style={styles.fileSize}>15.7 MB</Text>
-            <Button title="Send" onPress={() => Alert.alert('Sent', 'File sent to passenger')} />
+            <Button title="Send" onPress={() => Alert.alert('Sending', 'File sent to passenger')} />
           </TouchableOpacity>
 
           <TouchableOpacity style={styles.fileItem}>
             <Text style={styles.fileIcon}>🎵</Text>
             <Text style={styles.fileName}>playlist.mp3</Text>
             <Text style={styles.fileSize}>12.3 MB</Text>
-            <Button title="Send" onPress={() => Alert.alert('Sent', 'File sent to passenger')} />
+            <Button title="Send" onPress={() => Alert.alert('Sending', 'File sent to passenger')} />
           </TouchableOpacity>
         </View>
 
@@ -546,7 +793,7 @@ function FileShareScreen({route, navigation}) {
   );
 }
 
-// Group Chat Screen
+// Group Chat Screen with emoji reactions
 function GroupChatScreen({route, navigation}) {
   const {device} = route.params;
   const [messages, setMessages] = useState([
@@ -597,15 +844,21 @@ function GroupChatScreen({route, navigation}) {
           />
         </View>
 
-        <View style={styles.inputContainer}>
-          <TouchableOpacity style={styles.emojiButton}>
+        <View style={styles.emojiRow}>
+          <TouchableOpacity style={styles.emojiButton} onPress={() => setInputText(prev => prev + '😊')}>
             <Text style={styles.emojiButtonText}>😊</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.emojiButton}>
+          <TouchableOpacity style={styles.emojiButton} onPress={() => setInputText(prev => prev + '👍')}>
             <Text style={styles.emojiButtonText}>👍</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.emojiButton}>
+          <TouchableOpacity style={styles.emojiButton} onPress={() => setInputText(prev => prev + '🎬')}>
             <Text style={styles.emojiButtonText}>🎬</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.emojiButton} onPress={() => setInputText(prev => prev + '👏')}>
+            <Text style={styles.emojiButtonText}>👏</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.emojiButton} onPress={() => setInputText(prev => prev + '🔥')}>
+            <Text style={styles.emojiButtonText}>🔥</Text>
           </TouchableOpacity>
         </View>
 
@@ -617,6 +870,7 @@ function GroupChatScreen({route, navigation}) {
               onChangeText={setInputText}
               placeholder="Type a message..."
               placeholderTextColor="#999"
+              onSubmitEditing={sendMessage}
             />
             <Button title="Send" onPress={sendMessage} />
           </View>
@@ -635,6 +889,30 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f5f5f5',
   },
+  modalContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    padding: 24,
+  },
+  modalContent: {
+    maxWidth: 400,
+    alignItems: 'center',
+  },
+  modalTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  modalMessage: {
+    fontSize: 16,
+    color: '#666',
+    marginBottom: 24,
+    textAlign: 'center',
+    lineHeight: 24,
+  },
   loadingContainer: {
     flex: 1,
     justifyContent: 'center',
@@ -649,28 +927,10 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#666',
   },
-  errorContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 32,
-  },
-  errorContent: {
-    maxWidth: 400,
-    alignItems: 'center',
-  },
-  errorTitle: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#D32F2F',
-    marginBottom: 16,
-    textAlign: 'center',
-  },
-  errorText: {
-    fontSize: 16,
-    color: '#666',
-    marginBottom: 24,
-    textAlign: 'center',
+  loadingSubtext: {
+    marginTop: 8,
+    fontSize: 14,
+    color: '#999',
   },
   content: {
     flex: 1,
@@ -686,6 +946,12 @@ const styles = StyleSheet.create({
   subtitle: {
     fontSize: 16,
     color: '#666',
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  lastSync: {
+    fontSize: 14,
+    color: '#888',
     marginBottom: 24,
     textAlign: 'center',
   },
@@ -770,6 +1036,12 @@ const styles = StyleSheet.create({
     shadowRadius: 2,
     elevation: 1,
   },
+  deviceHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
   deviceName: {
     fontSize: 16,
     fontWeight: '600',
@@ -784,7 +1056,47 @@ const styles = StyleSheet.create({
   rssi: {
     fontSize: 12,
     color: '#888',
-    marginBottom: 8,
+  },
+  signalBars: {
+    flexDirection: 'row',
+    marginBottom: 12,
+  },
+  signalBar: {
+    width: 4,
+    height: 16,
+    borderRadius: 2,
+    marginRight: 2,
+  },
+  scanControls: {
+    marginBottom: 16,
+  },
+  devicesCount: {
+    fontSize: 14,
+    color: '#666',
+    marginBottom: 12,
+  },
+  scanningIndicator: {
+    marginTop: 16,
+    alignItems: 'center',
+  },
+  scanningText: {
+    fontSize: 14,
+    color: '#666',
+    marginTop: 8,
+  },
+  emptyState: {
+    marginTop: 48,
+    alignItems: 'center',
+  },
+  emptyText: {
+    fontSize: 16,
+    color: '#666',
+    fontWeight: '600',
+  },
+  emptySubtext: {
+    fontSize: 14,
+    color: '#999',
+    marginTop: 8,
   },
   advertiseCard: {
     backgroundColor: '#fff',
@@ -837,6 +1149,17 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontWeight: 'bold',
   },
+  connectingBadge: {
+    backgroundColor: '#FF9800',
+    padding: 8,
+    borderRadius: 6,
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  connectingText: {
+    color: '#fff',
+    fontWeight: 'bold',
+  },
   deviceActions: {
     marginTop: 16,
   },
@@ -874,11 +1197,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#007AFF',
     width: '0%',
   },
-  timeDisplay: {
+  timeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 8,
+  },
+  timeText: {
     fontSize: 14,
     color: '#666',
-    textAlign: 'center',
-    marginTop: 8,
   },
   syncInfo: {
     backgroundColor: '#E3F2FD',
@@ -886,10 +1212,17 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     marginBottom: 16,
   },
+  syncTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
   syncText: {
     fontSize: 14,
     color: '#1565C0',
     marginBottom: 4,
+    textAlign: 'center',
   },
   fileShareCard: {
     backgroundColor: '#fff',
@@ -972,17 +1305,22 @@ const styles = StyleSheet.create({
     textAlign: 'right',
     marginTop: 4,
   },
-  inputContainer: {
+  emojiRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
     marginBottom: 16,
   },
   emojiButton: {
     backgroundColor: '#E0E0E0',
     padding: 8,
     borderRadius: 8,
-    marginRight: 8,
+    marginLeft: 8,
   },
   emojiButtonText: {
     fontSize: 20,
+  },
+  inputContainer: {
+    marginBottom: 16,
   },
   chatInputRow: {
     flexDirection: 'row',
@@ -994,5 +1332,28 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     padding: 12,
     marginRight: 8,
+  },
+  quitButton: {
+    marginTop: 24,
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: '#f0f0f0',
+  },
+  quitText: {
+    fontSize: 16,
+    color: '#D32F2F',
+    fontWeight: 'bold',
+  },
+  connectedBadge: {
+    backgroundColor: '#E3F2FD',
+    padding: 12,
+    borderRadius: 8,
+    marginTop: 16,
+    alignItems: 'center',
+  },
+  connectedBadgeText: {
+    color: '#1565C0',
+    fontWeight: 'bold',
+    fontSize: 14,
   },
 });
